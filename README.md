@@ -65,6 +65,14 @@ If it is not:
 
 Without WebGPU, Phonolab still runs the full STFT / pitch / formant pass on the CPU. The badge in the header tells you which path is active.
 
+## Cheap mics and “everything reads feminine”
+
+Laptop and headset mics often high-pass around 80–120 Hz. A 110 Hz chest voice then looks like 220 Hz to a pitch tracker — which English listeners (and bad apps) call feminine.
+
+Phonolab splits **pitch** (F0) from **resonance** (F3 / tract length) and shows the **F1×F2 pair** (the vowel) instead of mashing them into one “gender” number.
+
+If recorded pitch is about twice what you expect, switch the range to **Chest (55–175 Hz)** and turn off the OS “noise suppression” if you can. Recording in Chrome with Phonolab’s Record button already disables echo cancellation, AGC, and noise suppression.
+
 ### 5. Optional: Grok transcription
 
 Local analysis never leaves the machine. **Transcribe with Grok** and **Phonetic reading** call the xAI API.

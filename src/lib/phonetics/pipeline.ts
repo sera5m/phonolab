@@ -2,10 +2,12 @@ import { clamp, lerp } from "@/lib/utils";
 import {
   extractTrack,
   mean,
+  median,
   slope,
   spectrogramMatrix,
   stdev,
   type FrameFeatures,
+  type PitchRangeId,
   type Track,
 } from "@/lib/audio/dsp";
 import type { SynthPhoneme } from "@/lib/audio/synth";
@@ -35,14 +37,15 @@ export type AnalyzeInput = {
   sampleRate: number;
   sourceName: string;
   backend: "webgpu" | "cpu";
+  pitchRange?: PitchRangeId;
   transcript?: TranscriptHint;
   known?: KnownSpan[];
 };
 
 export async function analyzeVoice(input: AnalyzeInput): Promise<AnalysisResult> {
-  const track = await extractTrack(input.samples, input.sampleRate);
-  const voicedF0 = track.frames.filter((f) => f.voiced && f.f0 > 60).map((f) => f.f0);
-  const meanF0 = voicedF0.length ? mean(voicedF0) : 0;
+  const track = await extractTrack(input.samples, input.sampleRate, input.pitchRange ?? "speech");
+  const voicedF0 = track.frames.filter((f) => f.voiced && f.f0 > 50).map((f) => f.f0);
+  const meanF0 = voicedF0.length ? median(voicedF0) : 0;
   const meanVolumeDb = mean(track.frames.map((f) => f.db));
 
   let phonemes: PhonemeHit[];
@@ -73,7 +76,14 @@ export async function analyzeVoice(input: AnalyzeInput): Promise<AnalysisResult>
 
   phonemes = phonemes.filter((p) => p.end - p.start > 0.018 && p.manner !== "silence");
 
-  const overallGender = blendGender(phonemes.map((p) => p.gender));
+  const overallGender = blendGender(phonemes);
+  const vowelFrames = track.frames.filter((f) => f.voiced && f.f1 > 80 && f.f2 > 80);
+  const meanF1 = mean(vowelFrames.map((f) => f.f1));
+  const meanF2 = mean(vowelFrames.map((f) => f.f2));
+  const meanF3 = mean(vowelFrames.filter((f) => f.f3 > 1500).map((f) => f.f3));
+  const vtlCm = meanF3 > 1500 ? (5 * 35000) / (4 * meanF3) : 0;
+  const bassRatio = measureBassRatio(track);
+  const micNote = micWarning(bassRatio, meanF0);
   const spec = spectrogramMatrix(track);
   const waveN = Math.min(1200, input.samples.length);
   const waveform = new Float32Array(waveN);
@@ -98,6 +108,13 @@ export async function analyzeVoice(input: AnalyzeInput): Promise<AnalysisResult>
     meanF0,
     meanVolumeDb,
     overallGender,
+    meanF1,
+    meanF2,
+    meanF3,
+    vtlCm,
+    bassRatio,
+    micNote,
+    pitchRange: input.pitchRange ?? "speech",
     backend: input.backend,
     sourceName: input.sourceName,
     spectrogram: spec,
@@ -136,19 +153,19 @@ function scoreSpan(
 ): PhonemeHit {
   const frames = framesIn(track, start, end);
   const use = frames.length ? frames : nearestFrame(track, (start + end) / 2);
-  const f0s = use.filter((f) => f.f0 > 60).map((f) => f.f0);
+  const f0s = use.filter((f) => f.f0 > 50).map((f) => f.f0);
   const f1s = use.filter((f) => f.f1 > 80).map((f) => f.f1);
   const f2s = use.filter((f) => f.f2 > 80).map((f) => f.f2);
-  const f3s = use.filter((f) => f.f3 > 80).map((f) => f.f3);
+  const f3s = use.filter((f) => f.f3 > 1500).map((f) => f.f3);
   const dbs = use.map((f) => f.db);
   const formants = {
     f1: mean(f1s),
     f2: mean(f2s),
     f3: mean(f3s),
   };
-  const f0 = mean(f0s);
+  const f0 = f0s.length ? median(f0s) : 0;
   const volumeDb = mean(dbs);
-  const gender = scoreGender(f0, formants, use);
+  const gender = scoreGender(f0, formants, use, meta.ipa);
   const attributes = scoreAttributes(use, f0);
   const subphonemes = splitSubphonemes(use, start, end);
   const identConf =
@@ -193,64 +210,86 @@ function nearestFrame(track: Track, t: number): FrameFeatures[] {
 function scoreGender(
   f0: number,
   formants: { f1: number; f2: number; f3: number },
-  frames: FrameFeatures[],
+  _frames: FrameFeatures[],
+  ipa: string,
 ): GenderScore {
   const cues: string[] = [];
-  let f0Score = 0;
-  let f0W = 0;
-  if (f0 > 60) {
-    f0Score = clamp((f0 - 145) / 80, -1.2, 1.2);
-    f0W = 0.58;
-    if (f0 < 150) cues.push(`F0 ${Math.round(f0)} Hz sits in the typical adult-male range`);
-    else if (f0 > 185) cues.push(`F0 ${Math.round(f0)} Hz sits in the typical adult-female range`);
-    else cues.push(`F0 ${Math.round(f0)} Hz is in the overlap zone — weaker cue`);
+
+  // Pitch is vocal-fold rate. 160 Hz is the middle of the overlap, not "female".
+  // Typical modal speech: adult male ~85–155 Hz (mean ~120), adult female ~165–255 (mean ~210).
+  let pitchCue = 0;
+  let pitchW = 0;
+  if (f0 > 50) {
+    pitchCue = clamp((f0 - 160) / 70, -1.25, 1.25);
+    pitchW = 0.7;
+    if (f0 < 145) {
+      cues.push(`Pitch ${Math.round(f0)} Hz — typical adult-male speaking range (~85–155 Hz)`);
+    } else if (f0 > 185) {
+      cues.push(`Pitch ${Math.round(f0)} Hz — typical adult-female speaking range (~165–255 Hz)`);
+    } else {
+      cues.push(
+        `Pitch ${Math.round(f0)} Hz is in the overlap. Pitch alone cannot call this masculine or feminine.`,
+      );
+    }
   }
-  const usable = [formants.f1, formants.f2, formants.f3].filter((x) => x > 80);
-  const meanF = usable.length ? mean(usable) : 0;
-  let formantScore = 0;
-  let formantW = 0;
-  let formantScale = 1;
-  if (meanF > 0) {
-    formantScale = meanF / 1500;
-    formantScore = clamp((meanF - 1550) / 420, -1.2, 1.2);
-    formantW = 0.32;
+
+  // F1 and F2 encode the vowel (height × frontness). Using their average as
+  // "gender" is why front vowels used to read feminine. F3 tracks tract length.
+  const f3 = formants.f3;
+  let resonanceCue = 0;
+  let resW = 0;
+  let vtlCm = 0;
+  if (f3 > 1500) {
+    vtlCm = (5 * 35000) / (4 * f3);
+    resonanceCue = clamp((f3 - 2750) / 450, -1.25, 1.25);
+    resW = 0.3;
     cues.push(
-      formantScale > 1.08
-        ? "Higher formants — shorter vocal-tract resonance"
-        : formantScale < 0.94
-          ? "Lower formants — longer vocal-tract resonance"
-          : "Formant scale near the mid talker average",
+      vtlCm > 16.6
+        ? `F3 ${Math.round(f3)} Hz ≈ ${vtlCm.toFixed(1)} cm tract — lower, longer-tube resonance`
+        : vtlCm < 15.2
+          ? `F3 ${Math.round(f3)} Hz ≈ ${vtlCm.toFixed(1)} cm tract — higher, shorter-tube resonance`
+          : `F3 ${Math.round(f3)} Hz ≈ ${vtlCm.toFixed(1)} cm tract — mid resonance`,
     );
   }
-  const tiltFrames = frames.filter((f) => f.spectrum.length > 20);
-  let tiltScore = 0;
-  let tiltW = 0;
-  if (tiltFrames.length) {
-    const tilts = tiltFrames.map((f) => spectralTilt(f));
-    const tilt = mean(tilts);
-    tiltScore = clamp((-tilt - 6) / 10, -1, 1);
-    tiltW = 0.1;
-  }
-  const wsum = f0W + formantW + tiltW || 1;
-  const score = clamp((f0Score * f0W + formantScore * formantW + tiltScore * tiltW) / wsum, -1, 1);
-  const inOverlap = f0 > 145 && f0 < 185;
-  const confidence = clamp((f0W ? 0.55 : 0.2) + Math.abs(score) * 0.35 - (inOverlap ? 0.18 : 0), 0.22, 0.95);
-  const label: GenderScore["label"] =
-    score > 0.18 ? "feminine-coded" : score < -0.18 ? "masculine-coded" : "androgynous";
-  return { score, label, confidence, f0Hz: f0, formantScale, cues };
-}
 
-function spectralTilt(frame: FrameFeatures) {
-  const n = frame.spectrum.length;
-  const lowN = Math.max(2, Math.floor(n * 0.12));
-  const highN = Math.max(2, Math.floor(n * 0.45));
-  let low = 0;
-  let high = 0;
-  for (let i = 1; i < lowN; i++) low += frame.spectrum[i]!;
-  for (let i = n - highN; i < n; i++) high += frame.spectrum[i]!;
-  low /= lowN;
-  high /= highN;
-  return 20 * Math.log10((high + 1e-8) / (low + 1e-8));
+  let vowelW = 0;
+  let vowelCue = 0;
+  if (formants.f1 > 80 && formants.f2 > 400) {
+    const { vowel } = nearestVowel(formants.f1, formants.f2, 0.5);
+    const distM = Math.hypot(formants.f1 - vowel.male[0], (formants.f2 - vowel.male[1]) * 0.55);
+    const distF = Math.hypot(formants.f1 - vowel.female[0], (formants.f2 - vowel.female[1]) * 0.55);
+    vowelCue = clamp((distM - distF) / 280, -1, 1);
+    vowelW = 0.06;
+    cues.push(
+      `F1×F2 ${Math.round(formants.f1)}×${Math.round(formants.f2)} Hz on /${ipa || vowel.ipa}/ is closer to typical ${
+        distM < distF ? "male" : "female"
+      } targets for that vowel`,
+    );
+  }
+
+  const wsum = pitchW + resW + vowelW || 1;
+  const score = clamp((pitchCue * pitchW + resonanceCue * resW + vowelCue * vowelW) / wsum, -1, 1);
+  const inOverlap = f0 > 145 && f0 < 185;
+  const confidence = clamp(
+    (pitchW ? 0.48 : 0.16) + Math.abs(score) * 0.28 - (inOverlap ? 0.24 : 0),
+    0.16,
+    0.9,
+  );
+  const label: GenderScore["label"] =
+    score > 0.24 ? "feminine-coded" : score < -0.24 ? "masculine-coded" : "androgynous";
+  const formantScale = vtlCm > 0 ? 16.5 / vtlCm : 1;
+  return {
+    score,
+    label,
+    confidence,
+    f0Hz: f0,
+    formantScale,
+    cues,
+    pitchCue: clamp(pitchCue, -1, 1),
+    resonanceCue: clamp(resonanceCue, -1, 1),
+    vtlCm,
+    f3Hz: f3,
+  };
 }
 
 function scoreAttributes(frames: FrameFeatures[], f0: number): AttributeScores {
@@ -508,28 +547,55 @@ function inferWordSpans(track: Track, text: string, phonemes: PhonemeHit[]): Wor
   }));
 }
 
-function blendGender(scores: GenderScore[]): GenderScore {
-  if (!scores.length) {
+function blendGender(phonemes: PhonemeHit[]): GenderScore {
+  const vowels = phonemes.filter(
+    (p) => p.f0 > 50 && (p.manner === "vowel" || p.manner === "diphthong"),
+  );
+  const use = vowels.length ? vowels : phonemes.filter((p) => p.f0 > 50);
+  if (!use.length) {
     return {
       score: 0,
       label: "androgynous",
       confidence: 0.2,
       f0Hz: 0,
       formantScale: 1,
-      cues: ["No voiced frames"],
+      cues: ["No voiced vowels to score"],
+      pitchCue: 0,
+      resonanceCue: 0,
+      vtlCm: 0,
+      f3Hz: 0,
     };
   }
-  const score = mean(scores.map((s) => s.score));
-  const confidence = mean(scores.map((s) => s.confidence));
-  const f0Hz = mean(scores.map((s) => s.f0Hz).filter((x) => x > 0));
-  const formantScale = mean(scores.map((s) => s.formantScale));
-  const label: GenderScore["label"] =
-    score > 0.18 ? "feminine-coded" : score < -0.18 ? "masculine-coded" : "androgynous";
-  const cues = [
-    `Mean F0 ${f0Hz ? Math.round(f0Hz) + " Hz" : "unvoiced"}`,
-    `Formant scale ${formantScale.toFixed(2)}×`,
-  ];
-  return { score, label, confidence, f0Hz, formantScale, cues };
+  const f0Hz = median(use.map((s) => s.gender.f0Hz).filter((x) => x > 0));
+  const f3Hz = mean(use.map((s) => s.gender.f3Hz).filter((x) => x > 1500));
+  // Clip-level gender is pitch + F3 only. Averaging every vowel's F1×F2
+  // is a mush that used to pull /i/ toward feminine.
+  return scoreGender(f0Hz, { f1: 0, f2: 0, f3: f3Hz }, [], "");
+}
+
+function measureBassRatio(track: Track) {
+  const binHz = track.sampleRate / track.fftSize;
+  let bass = 0;
+  let mid = 0;
+  const b1 = Math.max(2, Math.round(120 / binHz));
+  const m0 = Math.round(200 / binHz);
+  const m1 = Math.round(500 / binHz);
+  for (const f of track.frames) {
+    if (f.db < -42) continue;
+    for (let k = 1; k <= b1 && k < f.spectrum.length; k++) bass += f.spectrum[k]!;
+    for (let k = m0; k <= m1 && k < f.spectrum.length; k++) mid += f.spectrum[k]!;
+  }
+  return mid > 0 ? bass / mid : 1;
+}
+
+function micWarning(bassRatio: number, meanF0: number) {
+  if (bassRatio < 0.26 && meanF0 > 170) {
+    return "Very little energy below 120 Hz, and pitch is high. A headset mic often high-passes the fundamental, so the tracker reports 2×F0 (110 Hz reads as 220). Switch the range to Chest, or this is genuinely a high speaking pitch.";
+  }
+  if (bassRatio < 0.2) {
+    return "This clip is thin in the bass. F1 and low pitch are less reliable on a high-passed mic. Get closer, or use Chest range if the pitch looks twice what you expect.";
+  }
+  return null;
 }
 
 function percentile(values: number[], p: number) {

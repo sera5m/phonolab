@@ -5,6 +5,29 @@ export const TARGET_SR = 16000;
 export const FRAME_MS = 25;
 export const HOP_MS = 10;
 
+export type PitchRangeId = "chest" | "speech" | "head";
+
+export const PITCH_RANGES: Record<PitchRangeId, { minF: number; maxF: number; label: string; hint: string }> = {
+  chest: {
+    minF: 55,
+    maxF: 175,
+    label: "Chest",
+    hint: "55–175 Hz. Stops the tracker jumping to 2×F0 on a low voice or a thin mic.",
+  },
+  speech: {
+    minF: 70,
+    maxF: 300,
+    label: "Speech",
+    hint: "70–300 Hz. Default for mixed or unknown voices.",
+  },
+  head: {
+    minF: 140,
+    maxF: 400,
+    label: "Head",
+    hint: "140–400 Hz. For a high speaking pitch; stops octave-down errors.",
+  },
+};
+
 export type FrameFeatures = {
   t: number;
   rms: number;
@@ -39,14 +62,20 @@ export function frameParams(sr: number) {
   return { hop, frame, fftSize };
 }
 
-export async function extractTrack(samples: Float32Array, sampleRate: number): Promise<Track> {
+export async function extractTrack(
+  samples: Float32Array,
+  sampleRate: number,
+  range: PitchRangeId = "speech",
+): Promise<Track> {
   const { hop, frame, fftSize } = frameParams(sampleRate);
   const window = hamming(frame);
   const emphasized = preEmphasis(samples);
   const nyquist = sampleRate / 2;
   const binHz = sampleRate / fftSize;
+  const { minF, maxF } = PITCH_RANGES[range];
   const frames: FrameFeatures[] = [];
   let prevMag: Float32Array | null = null;
+  let prevF0 = 0;
 
   for (let start = 0; start + frame <= emphasized.length; start += hop) {
     const slice = emphasized.subarray(start, start + frame);
@@ -98,10 +127,11 @@ export async function extractTrack(samples: Float32Array, sampleRate: number): P
     }
     prevMag = mag;
 
-    const pitch = yinF0(raw, sampleRate);
+    const pitch = yinF0(raw, sampleRate, minF, maxF, prevF0);
     const formants = estimateFormants(slice, sampleRate, fftSize);
     const hnr = estimateHnr(raw, pitch.f0, sampleRate);
     const voiced = pitch.prob > 0.45 && db > -45 && zcr < 0.18;
+    if (voiced && pitch.f0 > 50) prevF0 = pitch.f0;
 
     frames.push({
       t: start / sampleRate,
@@ -124,6 +154,8 @@ export async function extractTrack(samples: Float32Array, sampleRate: number): P
       await new Promise((r) => setTimeout(r, 0));
     }
   }
+
+  smoothF0(frames);
 
   return {
     sampleRate,
@@ -156,7 +188,7 @@ export function spectrogramMatrix(track: Track, maxBins = 256) {
   return { data, rows, cols, binHz: track.sampleRate / track.fftSize };
 }
 
-function yinF0(frame: Float32Array, sr: number, minF = 70, maxF = 420) {
+function yinF0(frame: Float32Array, sr: number, minF: number, maxF: number, prevF0: number) {
   const n = frame.length;
   const tauMax = Math.min(n - 2, Math.floor(sr / minF));
   const tauMin = Math.max(2, Math.floor(sr / maxF));
@@ -179,13 +211,38 @@ function yinF0(frame: Float32Array, sr: number, minF = 70, maxF = 420) {
     running += d[tau]!;
     cmnd[tau] = running > 0 ? (d[tau]! * tau) / running : 1;
   }
-  const thresh = 0.14;
+
+  const mins: { tau: number; val: number }[] = [];
+  for (let tau = tauMin + 1; tau < tauMax; tau++) {
+    const v = cmnd[tau]!;
+    if (v < (cmnd[tau - 1] ?? 1) && v <= (cmnd[tau + 1] ?? 1) && v < 0.35) {
+      mins.push({ tau, val: v });
+    }
+  }
+
   let tauEst = -1;
-  for (let tau = tauMin; tau < tauMax; tau++) {
-    if (cmnd[tau]! < thresh) {
-      while (tau + 1 < tauMax && cmnd[tau + 1]! < cmnd[tau]!) tau++;
-      tauEst = tau;
-      break;
+  let bestVal = 1;
+  if (mins.length) {
+    let bestCost = Infinity;
+    for (const m of mins) {
+      const f = sr / m.tau;
+      const oct = prevF0 > 50 ? Math.abs(Math.log2(f / prevF0)) : 0;
+      const cost = m.val + 0.22 * oct;
+      if (cost < bestCost) {
+        bestCost = cost;
+        tauEst = m.tau;
+        bestVal = m.val;
+      }
+    }
+  } else {
+    const thresh = 0.12;
+    for (let tau = tauMin; tau < tauMax; tau++) {
+      if (cmnd[tau]! < thresh) {
+        while (tau + 1 < tauMax && cmnd[tau + 1]! < cmnd[tau]!) tau++;
+        tauEst = tau;
+        bestVal = cmnd[tau]!;
+        break;
+      }
     }
   }
   if (tauEst < 0) {
@@ -193,9 +250,11 @@ function yinF0(frame: Float32Array, sr: number, minF = 70, maxF = 420) {
     for (let tau = tauMin; tau <= tauMax; tau++) {
       if (cmnd[tau]! < cmnd[best]!) best = tau;
     }
-    if (cmnd[best]! > 0.45) return { f0: 0, prob: 0 };
+    if (cmnd[best]! > 0.42) return { f0: 0, prob: 0 };
     tauEst = best;
+    bestVal = cmnd[best]!;
   }
+
   const s0 = cmnd[tauEst - 1] ?? cmnd[tauEst]!;
   const s1 = cmnd[tauEst]!;
   const s2 = cmnd[tauEst + 1] ?? s1;
@@ -203,12 +262,25 @@ function yinF0(frame: Float32Array, sr: number, minF = 70, maxF = 420) {
   const shift = denom !== 0 ? (s2 - s0) / denom : 0;
   const tau = tauEst + shift;
   const f0 = sr / tau;
-  const prob = clamp(1 - s1, 0, 1);
+  const prob = clamp(1 - bestVal, 0, 1);
   return { f0, prob };
 }
 
+function smoothF0(frames: FrameFeatures[]) {
+  const n = frames.length;
+  const copy = frames.map((f) => f.f0);
+  for (let i = 0; i < n; i++) {
+    if (!frames[i]!.voiced || copy[i]! < 50) continue;
+    const win: number[] = [];
+    for (let j = i - 2; j <= i + 2; j++) {
+      if (j >= 0 && j < n && frames[j]!.voiced && copy[j]! > 50) win.push(copy[j]!);
+    }
+    if (win.length >= 3) frames[i]!.f0 = median(win);
+  }
+}
+
 function estimateFormants(frame: Float32Array, sr: number, fftSize: number) {
-  const order = sr > 12000 ? 14 : 10;
+  const order = sr > 12000 ? 16 : 12;
   const a = lpc(frame, order);
   if (!a) return [0, 0, 0];
   const re = new Float32Array(fftSize);
@@ -222,27 +294,41 @@ function estimateFormants(frame: Float32Array, sr: number, fftSize: number) {
     env[k] = mag > 1e-12 ? 1 / mag : 0;
   }
   const binHz = sr / fftSize;
-  const minBin = Math.round(180 / binHz);
-  const maxBin = Math.round(Math.min(4200, sr / 2 - 100) / binHz);
-  const peaks: { k: number; v: number }[] = [];
+  const peaks: { hz: number; v: number }[] = [];
+  const minBin = Math.round(160 / binHz);
+  const maxBin = Math.round(Math.min(4000, sr / 2 - 120) / binHz);
   for (let k = minBin + 1; k < maxBin; k++) {
     const v = env[k]!;
     if (v > (env[k - 1] ?? 0) && v >= (env[k + 1] ?? 0) && v > 0) {
-      peaks.push({ k, v });
+      peaks.push({ hz: k * binHz, v });
     }
   }
-  peaks.sort((p, q) => q.v - p.v);
-  const chosen: number[] = [];
+
+  const f1 = strongestIn(peaks, 200, 950);
+  const f2 = strongestIn(
+    peaks.filter((p) => p.hz > (f1 || 200) + 220),
+    700,
+    2600,
+  );
+  const f3 = strongestIn(
+    peaks.filter((p) => p.hz > (f2 || 800) + 220),
+    1800,
+    3800,
+  );
+  return [f1, f2, f3];
+}
+
+function strongestIn(peaks: { hz: number; v: number }[], lo: number, hi: number) {
+  let bestHz = 0;
+  let bestV = 0;
   for (const p of peaks) {
-    const hz = p.k * binHz;
-    if (chosen.every((c) => Math.abs(c - hz) > 280)) {
-      chosen.push(hz);
-      if (chosen.length >= 3) break;
+    if (p.hz < lo || p.hz > hi) continue;
+    if (p.v > bestV) {
+      bestV = p.v;
+      bestHz = p.hz;
     }
   }
-  chosen.sort((a, b) => a - b);
-  while (chosen.length < 3) chosen.push(0);
-  return chosen;
+  return bestHz;
 }
 
 function lpc(frame: Float32Array, order: number) {
@@ -289,6 +375,13 @@ function estimateHnr(frame: Float32Array, f0: number, sr: number) {
 export function mean(values: number[]) {
   if (!values.length) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+export function median(values: number[]) {
+  if (!values.length) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m]! : ((s[m - 1] ?? 0) + (s[m] ?? 0)) / 2;
 }
 
 export function stdev(values: number[]) {

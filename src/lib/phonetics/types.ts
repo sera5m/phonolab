@@ -36,6 +36,12 @@ export type GenderScore = {
   f0Hz: number;
   formantScale: number;
   cues: string[];
+  /** Pitch-only cue, independent of the vowel. */
+  pitchCue: number;
+  /** Resonance/VTL cue from F3, mostly independent of the vowel. */
+  resonanceCue: number;
+  vtlCm: number;
+  f3Hz: number;
 };
 
 export type AttributeScores = {
@@ -87,6 +93,13 @@ export type AnalysisResult = {
   meanF0: number;
   meanVolumeDb: number;
   overallGender: GenderScore;
+  meanF1: number;
+  meanF2: number;
+  meanF3: number;
+  vtlCm: number;
+  bassRatio: number;
+  micNote: string | null;
+  pitchRange: "chest" | "speech" | "head";
   backend: "webgpu" | "cpu";
   sourceName: string;
   spectrogram: SpectrogramData;

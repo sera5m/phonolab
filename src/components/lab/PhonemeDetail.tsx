@@ -19,7 +19,6 @@ type Props = {
 
 export function PhonemeDetail({ phoneme: p, onPlay }: Props) {
   const g = p.gender;
-  const needle = ((g.score + 1) / 2) * 100;
   return (
     <div className="flex flex-col gap-5">
       <div className="flex items-start justify-between gap-3">
@@ -47,31 +46,48 @@ export function PhonemeDetail({ phoneme: p, onPlay }: Props) {
         </Button>
       </div>
 
+      <div className="rounded-md bg-surface-2 px-3 py-3">
+        <div className="text-[11px] uppercase tracking-wider text-subtle">Frequency pair</div>
+        <div className="mt-1 font-mono text-2xl tabular-nums tracking-tight text-fg">
+          {formatHz(p.formants.f1)} <span className="text-subtle">×</span> {formatHz(p.formants.f2)}
+        </div>
+        <p className="mt-1 text-xs text-muted">
+          F1 height × F2 front/back. F3 {formatHz(p.formants.f3)}
+          {g.vtlCm ? ` · tract ~${g.vtlCm.toFixed(1)} cm` : ""}
+        </p>
+      </div>
+
+      <CueMeter
+        label="Pitch"
+        hint="Vocal-fold rate. Independent of the vowel."
+        cue={g.pitchCue}
+        value={formatHz(g.f0Hz)}
+        low="~120 Hz masc"
+        high="~210 Hz fem"
+      />
+      <CueMeter
+        label="Resonance"
+        hint="Vocal-tract length from F3 — not F1/F2, which are the vowel."
+        cue={g.resonanceCue}
+        value={formatHz(g.f3Hz)}
+        low="longer tract"
+        high="shorter tract"
+      />
+
       <div>
         <div className="mb-2 flex items-center justify-between text-xs">
-          <span className="text-muted">Acoustic gender</span>
+          <span className="text-muted">Listener impression (pitch + resonance, not identity)</span>
           <span className="font-mono text-fg">
             {g.label} · {formatPct(g.confidence)} conf.
           </span>
         </div>
         <div className="relative h-2 rounded-full bg-surface-2">
-          <div
-            className="absolute inset-y-0 left-0 rounded-full bg-steel/70"
-            style={{ width: "50%" }}
-          />
-          <div
-            className="absolute inset-y-0 right-0 rounded-full bg-accent/70"
-            style={{ width: "50%" }}
-          />
+          <div className="absolute inset-y-0 left-0 w-1/2 rounded-l-full bg-steel/70" />
+          <div className="absolute inset-y-0 right-0 w-1/2 rounded-r-full bg-accent/70" />
           <div
             className="absolute top-1/2 size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-fg shadow-[var(--shadow-border)]"
-            style={{ left: `${needle}%` }}
+            style={{ left: `${((g.score + 1) / 2) * 100}%` }}
           />
-        </div>
-        <div className="mt-1 flex justify-between font-mono text-[11px] text-subtle">
-          <span>masculine-coded</span>
-          <span>{formatHz(g.f0Hz)}</span>
-          <span>feminine-coded</span>
         </div>
         <ul className="mt-3 space-y-1 text-xs text-muted">
           {g.cues.map((c) => (
@@ -84,9 +100,6 @@ export function PhonemeDetail({ phoneme: p, onPlay }: Props) {
         <Stat label="Volume" value={formatDb(p.volumeDb)} />
         <Stat label="F0" value={formatHz(p.f0)} />
         <Stat label="Confidence" value={formatPct(p.confidence)} />
-        <Stat label="F1" value={formatHz(p.formants.f1)} />
-        <Stat label="F2" value={formatHz(p.formants.f2)} />
-        <Stat label="F3" value={formatHz(p.formants.f3)} />
       </div>
 
       <div>
@@ -116,6 +129,41 @@ export function PhonemeDetail({ phoneme: p, onPlay }: Props) {
             </div>
           ))}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function CueMeter({
+  label,
+  hint,
+  cue,
+  value,
+  low,
+  high,
+}: {
+  label: string;
+  hint: string;
+  cue: number;
+  value: string;
+  low: string;
+  high: string;
+}) {
+  return (
+    <div title={hint}>
+      <div className="mb-1 flex items-center justify-between text-xs">
+        <span className="text-muted">{label}</span>
+        <span className="font-mono text-fg">{value}</span>
+      </div>
+      <div className="relative h-1.5 rounded-full bg-surface-2">
+        <div
+          className="absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-fg"
+          style={{ left: `${((cue + 1) / 2) * 100}%` }}
+        />
+      </div>
+      <div className="mt-1 flex justify-between font-mono text-[11px] text-subtle">
+        <span>{low}</span>
+        <span>{high}</span>
       </div>
     </div>
   );
@@ -153,7 +201,7 @@ function SubRow({ sub }: { sub: Subphoneme }) {
       </span>
       <span className="flex-1 font-mono text-xs text-fg">{arrow}</span>
       <span className="font-mono text-[11px] tabular-nums text-subtle">
-        F0 {formatHz(sub.f0)} · {formatDb(sub.energyDb)}
+        {formatHz(sub.f1)}×{formatHz(sub.f2)} · {formatHz(sub.f0)}
       </span>
     </div>
   );

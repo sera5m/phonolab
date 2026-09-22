@@ -16,14 +16,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { DEMO_CLIPS, synthesize, type DemoClip } from "@/lib/audio/synth";
 import { decodeFile, playSamples } from "@/lib/audio/decode";
 import { detectGpu, type GpuInfo } from "@/lib/audio/gpu";
+import { PITCH_RANGES, type PitchRangeId } from "@/lib/audio/dsp";
 import { wavToBase64 } from "@/lib/audio/wav";
 import { analyzeVoice } from "@/lib/phonetics/pipeline";
 import { interpretVoice, transcribeClip } from "@/lib/ai/stt";
 import type { AnalysisResult, PhonemeHit } from "@/lib/phonetics/types";
-import { cn, formatDb, formatHz, formatPct } from "@/lib/utils";
+import { cn, formatHz } from "@/lib/utils";
 import { Spectrogram } from "./Spectrogram";
 import { PhonemeTimeline } from "./PhonemeTimeline";
 import { PhonemeDetail } from "./PhonemeDetail";
+import { FormantSpace } from "./FormantSpace";
 
 type Status = "boot" | "ready" | "working" | "error";
 
@@ -31,6 +33,12 @@ const SAMPLE_CACHE: { samples: Float32Array; sampleRate: number } = {
   samples: new Float32Array(0),
   sampleRate: 16000,
 };
+
+const LAST_META: {
+  name: string;
+  known?: { ipa: string; start: number; end: number; spec?: DemoClip["phonemes"][number] }[];
+  transcript?: { text: string; words?: { word: string; start: number; end: number }[] };
+} = { name: "clip" };
 
 export function Phonolab() {
   const [gpu, setGpu] = useState<GpuInfo | null>(null);
@@ -44,6 +52,7 @@ export function Phonolab() {
   const [recording, setRecording] = useState(false);
   const [aiNote, setAiNote] = useState<string | null>(null);
   const [aiBusy, setAiBusy] = useState<"stt" | "note" | null>(null);
+  const [pitchRange, setPitchRange] = useState<PitchRangeId>("speech");
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -64,7 +73,8 @@ export function Phonolab() {
       sampleRate: number;
       name: string;
       known?: { ipa: string; start: number; end: number; spec?: DemoClip["phonemes"][number] }[];
-      transcript?: { text: string };
+      transcript?: { text: string; words?: { word: string; start: number; end: number }[] };
+      pitchRange?: PitchRangeId;
     }) => {
       setStatus("working");
       setStage("Framing · STFT · pitch · LPC");
@@ -72,6 +82,10 @@ export function Phonolab() {
       setAiNote(null);
       SAMPLE_CACHE.samples = opts.samples;
       SAMPLE_CACHE.sampleRate = opts.sampleRate;
+      LAST_META.name = opts.name;
+      LAST_META.known = opts.known;
+      LAST_META.transcript = opts.transcript;
+      const range = opts.pitchRange ?? pitchRange;
       try {
         await new Promise((r) => setTimeout(r, 30));
         const result = await analyzeVoice({
@@ -81,6 +95,7 @@ export function Phonolab() {
           backend: gpu?.backend ?? "cpu",
           known: opts.known,
           transcript: opts.transcript,
+          pitchRange: range,
         });
         setAnalysis(result);
         setSelectedId(result.phonemes[0]?.id ?? null);
@@ -90,7 +105,7 @@ export function Phonolab() {
         setError(err instanceof Error ? err.message : "Analysis failed");
       }
     },
-    [gpu],
+    [gpu, pitchRange],
   );
 
   const loadDemo = useCallback(
@@ -144,7 +159,14 @@ export function Phonolab() {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+        },
+      });
       const rec = new MediaRecorder(stream);
       chunksRef.current = [];
       rec.ondataavailable = (e) => {
@@ -200,17 +222,30 @@ export function Phonolab() {
     const summary = [
       `Source: ${analysis.sourceName}`,
       `Transcript: ${analysis.transcript}`,
-      `Mean F0 ${Math.round(analysis.meanF0)} Hz, volume ${analysis.meanVolumeDb.toFixed(1)} dB`,
-      `Overall gender: ${analysis.overallGender.label} (${analysis.overallGender.score.toFixed(2)}, conf ${analysis.overallGender.confidence.toFixed(2)})`,
+      `Mean F0 ${Math.round(analysis.meanF0)} Hz, F1×F2 ${Math.round(analysis.meanF1)}×${Math.round(analysis.meanF2)}, F3 ${Math.round(analysis.meanF3)}`,
+      `Overall: ${analysis.overallGender.label} (score ${analysis.overallGender.score.toFixed(2)}, pitchCue ${analysis.overallGender.pitchCue.toFixed(2)}, resCue ${analysis.overallGender.resonanceCue.toFixed(2)})`,
       ...analysis.phonemes.map(
         (p) =>
-          `/${p.ipa}/ ${p.start.toFixed(2)}–${p.end.toFixed(2)}s F0=${Math.round(p.f0)} F1=${Math.round(p.formants.f1)} F2=${Math.round(p.formants.f2)} vol=${p.volumeDb.toFixed(1)} gender=${p.gender.score.toFixed(2)} ${p.subphonemes.map((s) => `${s.phase}:${s.contour}`).join(",")}`,
+          `/${p.ipa}/ ${p.start.toFixed(2)}–${p.end.toFixed(2)}s F0=${Math.round(p.f0)} F1×F2=${Math.round(p.formants.f1)}×${Math.round(p.formants.f2)} F3=${Math.round(p.formants.f3)} vol=${p.volumeDb.toFixed(1)} gender=${p.gender.score.toFixed(2)} ${p.subphonemes.map((s) => `${s.phase}:${s.contour}`).join(",")}`,
       ),
     ].join("\n");
     const result = await interpretVoice({ data: { summary } });
     setAiBusy(null);
     if (!result.ok) setError(result.error);
     else setAiNote(result.text);
+  }
+
+  function changeRange(next: PitchRangeId) {
+    setPitchRange(next);
+    if (!SAMPLE_CACHE.samples.length) return;
+    void runAnalysis({
+      samples: SAMPLE_CACHE.samples,
+      sampleRate: SAMPLE_CACHE.sampleRate,
+      name: LAST_META.name,
+      known: LAST_META.known,
+      transcript: LAST_META.transcript,
+      pitchRange: next,
+    });
   }
 
   function playSelection() {
@@ -238,6 +273,10 @@ export function Phonolab() {
             source: analysis.sourceName,
             transcript: analysis.transcript,
             meanF0: analysis.meanF0,
+            meanF1: analysis.meanF1,
+            meanF2: analysis.meanF2,
+            meanF3: analysis.meanF3,
+            vtlCm: analysis.vtlCm,
             gender: analysis.overallGender,
             phonemes: analysis.phonemes.map((p) => ({
               ipa: p.ipa,
@@ -279,8 +318,8 @@ export function Phonolab() {
                 Phonolab
               </h1>
               <p className="mt-2 max-w-xl text-sm text-muted text-pretty">
-                Pull phonemes out of a voice clip, score each one for acoustic gender, attributes, and
-                volume, then inspect the spectrogram.
+                Pitch and resonance are separate. F1×F2 is the vowel — the frequency pair Voice Tools
+                never showed. Cheap mics hide low F0; switch to Chest if pitch looks twice too high.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
@@ -366,8 +405,11 @@ export function Phonolab() {
                   <div>
                     <h2 className="text-sm font-medium text-fg">{analysis.sourceName}</h2>
                     <p className="mt-0.5 font-mono text-xs text-muted">
-                      {analysis.duration.toFixed(2)} s · {formatHz(analysis.meanF0)} mean F0 ·{" "}
-                      {formatDb(analysis.meanVolumeDb)} · {analysis.phonemes.length} phonemes
+                      {analysis.duration.toFixed(2)} s · {formatHz(analysis.meanF0)} F0 · F1×F2{" "}
+                      {formatHz(analysis.meanF1)}×{formatHz(analysis.meanF2)} · F3{" "}
+                      {formatHz(analysis.meanF3)}
+                      {analysis.vtlCm ? ` · ${analysis.vtlCm.toFixed(1)} cm tract` : ""} ·{" "}
+                      {analysis.phonemes.length} phonemes
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -381,13 +423,43 @@ export function Phonolab() {
                     </Button>
                   </div>
                 </div>
-                <Spectrogram
-                  analysis={analysis}
-                  selected={selected}
-                  expanded={expanded}
-                  playhead={selected ? (selected.start + selected.end) / 2 : null}
-                  onSelectTime={selectAtTime}
-                />
+                <div className="mb-4 flex flex-wrap gap-2">
+                  {(Object.keys(PITCH_RANGES) as PitchRangeId[]).map((id) => (
+                    <Tooltip key={id}>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={() => changeRange(id)}
+                          className={cn(
+                            "rounded-sm px-3 py-1.5 text-xs font-medium shadow-[var(--shadow-border)]",
+                            pitchRange === id ? "bg-fg text-bg" : "bg-surface-2 text-muted",
+                          )}
+                        >
+                          {PITCH_RANGES[id].label}
+                          <span className="ml-1.5 font-mono text-[10px] opacity-70">
+                            {PITCH_RANGES[id].minF}–{PITCH_RANGES[id].maxF}
+                          </span>
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>{PITCH_RANGES[id].hint}</TooltipContent>
+                    </Tooltip>
+                  ))}
+                </div>
+                {analysis.micNote ? (
+                  <p className="mb-4 rounded-md bg-warn/10 px-3 py-2 text-xs text-warn text-pretty">
+                    {analysis.micNote}
+                  </p>
+                ) : null}
+                <VoiceProfile analysis={analysis} />
+                <div className="mt-4">
+                  <Spectrogram
+                    analysis={analysis}
+                    selected={selected}
+                    expanded={expanded}
+                    playhead={selected ? (selected.start + selected.end) / 2 : null}
+                    onSelectTime={selectAtTime}
+                  />
+                </div>
                 <div className="mt-4">
                   <PhonemeTimeline
                     phonemes={analysis.phonemes}
@@ -395,6 +467,9 @@ export function Phonolab() {
                     selectedId={selected?.id ?? null}
                     onSelect={setSelectedId}
                   />
+                </div>
+                <div className="mt-6">
+                  <FormantSpace analysis={analysis} selected={selected} onSelect={setSelectedId} />
                 </div>
               </section>
 
@@ -405,8 +480,11 @@ export function Phonolab() {
                     {analysis.transcript || "Acoustic labels only — transcribe to attach English words."}
                   </p>
                   <div className="mt-4 flex flex-wrap gap-2">
+                    <Badge variant="steel">pitch {formatHz(analysis.meanF0)}</Badge>
+                    <Badge>
+                      F1×F2 {formatHz(analysis.meanF1)}×{formatHz(analysis.meanF2)}
+                    </Badge>
                     <Badge variant="accent">{analysis.overallGender.label}</Badge>
-                    <Badge>{formatPct(analysis.overallGender.confidence)} overall conf.</Badge>
                     <Badge variant="steel">{analysis.backend === "webgpu" ? "WebGPU" : "CPU"} path</Badge>
                   </div>
                   <Separator className="my-4" />
@@ -432,8 +510,8 @@ export function Phonolab() {
                     <p className="mt-4 text-sm text-muted text-pretty">{aiNote}</p>
                   ) : (
                     <p className="mt-4 text-xs text-subtle">
-                      Transcription and the phonetic reading are optional, user-started calls. The spectrogram,
-                      gender, attributes, and volume are measured locally.
+                      Transcription and the phonetic reading are optional, user-started calls. Pitch,
+                      F1×F2, F3, and the spectrogram are measured on this machine.
                     </p>
                   )}
                 </div>
@@ -450,33 +528,99 @@ export function Phonolab() {
               className="flex w-full items-center justify-between text-left"
               onClick={() => setGuideOpen((v) => !v)}
             >
-              <span className="text-sm font-medium text-fg">How a phoneme is built</span>
+              <span className="text-sm font-medium text-fg">Pitch, resonance, and frequency pairs</span>
               <ChevronDown className={cn("size-4 text-muted transition-transform duration-200", guideOpen && "rotate-180")} />
             </button>
             {guideOpen ? (
-              <div className="mt-4 grid gap-4 text-sm text-muted md:grid-cols-3">
+              <div className="mt-4 grid gap-4 text-sm text-muted md:grid-cols-2">
                 <GuideCard
-                  title="Onset · start"
-                  body="Energy rises and formants transition out of the previous sound. For a stop this is the burst plus voice-onset time; for a vowel it is the formant glide in."
+                  title="Pitch ≠ resonance"
+                  body="Pitch (F0) is how fast the folds vibrate. Resonance is the tube above them — F3 tracks its length. You can have a low pitch with a short-tube (bright) resonance, or the reverse. English listeners use both. Voice Tools mashed them into one number; we do not."
                 />
                 <GuideCard
-                  title="Nucleus · center"
-                  body="The steady target. Vowel identity lives in F1 (tongue height) and F2 (front/back). Gender perception leans on F0 here, with formant scale as a second cue."
+                  title="F1 × F2 is the vowel"
+                  body="F1 is tongue height (high F1 = open, /ɑ/). F2 is front/back (high F2 = front, /i/). That pair is the vowel identity. Averaging F1+F2+F3 and calling it gender is why /i/ used to read feminine and /u/ masculine on the same voice."
                 />
                 <GuideCard
-                  title="Coda · end"
-                  body="Energy drops and formants head toward the next phoneme. Rise vs. drop of F0 and intensity in this window is the contour we score."
+                  title="Cheap mics and low F0"
+                  body="Adult-male modal speech is often ~85–155 Hz (mean ~120) with F3 ~2500 Hz. Adult-female is often ~165–255 Hz (mean ~210) with F3 ~3000 Hz. 150–180 Hz is overlap. A headset that high-passes at 100 Hz hides a 110 Hz fundamental so the tracker reports 220. Use Chest range (55–175 Hz) if that happens."
+                />
+                <GuideCard
+                  title="Onset · nucleus · coda"
+                  body="A phoneme is not a still frame. Onset: energy rises, formants glide in. Nucleus: the F1×F2 target. Coda: energy drops toward the next sound. Click a glyph on the timeline, then a gold dot on the vowel chart."
                 />
               </div>
             ) : (
               <p className="mt-2 text-xs text-subtle">
-                Spelled phoneme. Each one has an onset, nucleus, and coda — not a single snapshot.
+                Pitch is folds. Resonance is the tube. F1×F2 is the vowel. Cheap mics lie about the low end.
               </p>
             )}
           </section>
         </main>
       </div>
     </TooltipProvider>
+  );
+}
+
+function VoiceProfile({ analysis }: { analysis: AnalysisResult }) {
+  const g = analysis.overallGender;
+  return (
+    <div className="mb-4 grid gap-3 sm:grid-cols-3">
+      <ProfileMeter
+        label="Pitch"
+        value={formatHz(analysis.meanF0)}
+        cue={g.pitchCue}
+        low="masc ~120"
+        high="fem ~210"
+      />
+      <ProfileMeter
+        label="Resonance (F3)"
+        value={formatHz(analysis.meanF3)}
+        cue={g.resonanceCue}
+        low="long tract"
+        high="short tract"
+      />
+      <div className="rounded-md bg-surface-2 px-3 py-2">
+        <div className="text-[11px] uppercase tracking-wider text-subtle">F1 × F2</div>
+        <div className="mt-1 font-mono text-lg tabular-nums text-fg">
+          {formatHz(analysis.meanF1)} × {formatHz(analysis.meanF2)}
+        </div>
+        <p className="mt-1 text-[11px] text-subtle">height × front/back — the vowel pair</p>
+      </div>
+    </div>
+  );
+}
+
+function ProfileMeter({
+  label,
+  value,
+  cue,
+  low,
+  high,
+}: {
+  label: string;
+  value: string;
+  cue: number;
+  low: string;
+  high: string;
+}) {
+  return (
+    <div className="rounded-md bg-surface-2 px-3 py-2">
+      <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-subtle">
+        <span>{label}</span>
+        <span className="font-mono text-fg normal-case tracking-normal">{value}</span>
+      </div>
+      <div className="relative mt-3 h-1.5 rounded-full bg-bg">
+        <div
+          className="absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-fg"
+          style={{ left: `${((cue + 1) / 2) * 100}%` }}
+        />
+      </div>
+      <div className="mt-1.5 flex justify-between font-mono text-[11px] text-subtle">
+        <span>{low}</span>
+        <span>{high}</span>
+      </div>
+    </div>
   );
 }
 
